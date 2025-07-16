@@ -1,0 +1,121 @@
+import os
+import re
+import pandas as pd
+import configparser
+import teradatasql
+
+# ------------------------ CONFIG ------------------------
+INPUT_EXCEL = "Book1.xlsx"  # Your input Excel file
+CONFIG_FILE = "teradata_config.txt"  # Teradata credentials
+OUTPUT_FILE = "recursive_view_steps.xlsx"  # Output Excel file
+MAX_DEPTH = 10
+
+# ------------------- UTILITY FUNCTIONS ------------------
+def remove_sql_comments(sql_string):
+    sql_string = re.sub(r'/\*.*?\*/', '', sql_string, flags=re.DOTALL)
+    return re.sub(r'--.*', '', sql_string)
+
+def extract_sql_metadata(sql_string):
+    if not sql_string or not sql_string.strip(): return []
+    sql_no_comments = remove_sql_comments(sql_string)
+    sql_flat = re.sub(r'\s+', ' ', sql_no_comments).strip()
+    pattern = re.compile(r'\b(?:FROM|JOIN|UPDATE|INTO|TABLE)\s+([\w\.\[\]`"]+)', re.IGNORECASE)
+    matches = pattern.findall(sql_flat)
+    return sorted({re.sub(r'[\[\]`"]', '', m) for m in matches})
+
+def get_object_type(cursor, db_name, obj_name):
+    try:
+        cursor.execute(f"""
+            SELECT TableKind 
+            FROM DBC.TablesV 
+            WHERE DatabaseName = '{db_name}' AND TableName = '{obj_name}'
+        """)
+        result = cursor.fetchone()
+        if result:
+            kind = result[0]
+            if kind == 'V': return 'VIEW'
+            if kind == 'T': return 'TABLE'
+            return f"OTHER ({kind})"
+    except Exception as e:
+        return f"ERROR: {e}"
+    return "UNKNOWN"
+
+# ------------------- MAIN RECURSIVE LOGIC ------------------
+def fetch_recursive_view_steps(initial_views, max_depth=10, config_path=CONFIG_FILE):
+    config = configparser.ConfigParser()
+    config.read(config_path)
+    td = config['teradata']
+    host, user, pwd, auth = td['host'], td['username'], td['password'], td.get('authentication')
+
+    visited = set()
+    all_data = []
+
+    with teradatasql.connect(host=host, user=user, password=pwd, logmech=auth) as conn:
+        cursor = conn.cursor()
+
+        for origin_view in initial_views:
+            queue = [(origin_view, 1, None)]  # (current_view, level, parent_view)
+            while queue:
+                current_view, level, parent = queue.pop(0)
+                if (origin_view, current_view) in visited or level > max_depth:
+                    continue
+                visited.add((origin_view, current_view))
+                try:
+                    cursor.execute(f"SHOW VIEW {current_view};")
+                    ddl = '\n'.join(row[0] for row in cursor.fetchall())
+                    base_objs = extract_sql_metadata(ddl)
+
+                    base_tables = []
+                    nested_views = []
+                    for full_name in base_objs:
+                        if '.' not in full_name:
+                            continue
+                        db, tbl = full_name.split('.', 1)
+                        obj_type = get_object_type(cursor, db.strip(), tbl.strip())
+                        if obj_type == 'VIEW':
+                            nested_views.append(full_name)
+                        elif obj_type == 'TABLE':
+                            base_tables.append(full_name)
+
+                    all_data.append({
+                        "Original View": origin_view,
+                        "Level": level,
+                        "Current View": current_view,
+                        "Parent View": parent if parent else '',
+                        "View DDL": ddl,
+                        "Base Tables": ', '.join(base_tables),
+                        "Nested Views": ', '.join(nested_views)
+                    })
+
+                    for nested in nested_views:
+                        queue.append((nested, level + 1, current_view))
+                except Exception as e:
+                    all_data.append({
+                        "Original View": origin_view,
+                        "Level": level,
+                        "Current View": current_view,
+                        "Parent View": parent if parent else '',
+                        "View DDL": f"ERROR: {e}",
+                        "Base Tables": '',
+                        "Nested Views": ''
+                    })
+
+    return all_data
+
+# ------------------------ MAIN ------------------------
+def main():
+    print("\U0001F4C5 Reading input Excel...")
+    df = pd.read_excel(INPUT_EXCEL)
+    initial_views = df['Metadata'].dropna().unique().tolist()
+
+    print("\U0001F501 Starting detailed recursive DDL extraction...")
+    result_data = fetch_recursive_view_steps(initial_views, max_depth=MAX_DEPTH)
+
+    print("\U0001F4C4 Writing structured results to Excel...")
+    df_final = pd.DataFrame(result_data)
+    df_final.to_excel(OUTPUT_FILE, index=False, engine='openpyxl')
+
+    print(f"\u2705 Done! Recursive steps saved to: {OUTPUT_FILE}")
+
+if __name__ == "__main__":
+    main()
